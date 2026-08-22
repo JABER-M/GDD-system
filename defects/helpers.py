@@ -45,7 +45,18 @@ def draw_contours(image, contours, color=(0, 0, 255), thickness=2, label=None):
 # glove to skin) - the margin here is the one place that knowledge is
 # encoded, so every detector using it stays consistent.
 BORDER_TOUCH_PX = 5       # how close to the frame edge counts as "touching"
-CUFF_MARGIN_RATIO = 0.25  # how far inward from a touched edge to exclude, vs glove bbox diagonal
+# How far inward from a touched edge to exclude, vs glove bbox diagonal. A
+# touched edge isn't always the wrist/cuff - a tightly-framed close-up photo
+# can just as easily touch a frame edge with a fingertip or the side of the
+# palm, and 0.25 (tried first) was found too large: it swallowed real,
+# correctly-positioned defects on more than one close-up test photo (two
+# separate real holes merged/one dropped; a real ink-mark "stain" dropped)
+# once the hand filled enough of the frame to touch an edge for a reason
+# other than the cuff. 0.15 still fully excludes the actual blend band on
+# the photo that originally motivated this margin (confirmed empty result
+# there down to 0.06), while no longer reaching far enough in to cost real
+# defects on the photos above.
+CUFF_MARGIN_RATIO = 0.15
 
 
 def border_touching_margin_mask(glove_result, image_shape):
@@ -212,6 +223,21 @@ def color_residual_outlier_mask(mask, lab, mad_multiplier, blur_sigma):
 # caught by both is not counted twice.
 LARGE_ANOMALY_AREA_RATIO = 0.005  # boundary vs. stains/spots - see stain_detector.py's own upper bound
 
+# A hole/tear is a puncture: it exposes whatever is BEHIND the glove at
+# that spot, which in every real photo is either the background or skin -
+# both are, empirically, dramatically brighter than the glove's own dyed
+# material at the shadowed depth of a puncture (skin patches measured
+# L~167 on the 0-255 LAB scale used here). A big, strongly-colored surface
+# mark (ink, paint, dirt used to stage a "spot"/"stain" defect for testing)
+# does NOT expose anything behind the glove - it just sits on top of it -
+# and is free to be any color, including very dark ones (measured
+# L~48-73 for real ink marks in this project's test photos): without this
+# check, a large enough dark mark passes every other hole/tear test (it's
+# a big, round, strongly anomalous patch) and gets wrongly reported as a
+# hole. The gap between the two groups (73 vs 167) is wide enough that a
+# threshold placed in the middle has a comfortable margin on both sides.
+MIN_ANOMALY_LIGHTNESS = 110
+
 # A large hole/tear has an interior color that is fairly uniform (skin, or
 # background), so with blur_sigma=25 (the same value stain_detector.py/
 # spot_detector.py use for small marks) the local blur near the MIDDLE of a
@@ -292,6 +318,17 @@ def find_hole_or_tear_regions(glove_result, preprocessed, min_area_ratio=LARGE_A
         anomalous_fraction = np.mean(region_residuals > color_evidence_threshold)
         if anomalous_fraction < SHADOW_REJECTION_MIN_FRACTION:
             continue  # only patchily/weakly elevated - a shadow, not real damage
+        # A dark, strongly-pigmented mark (e.g. ink used to stage a "spot"/
+        # "stain" defect) can be different enough from the glove's own
+        # color to also cross glove_detector.py's coarse background-
+        # distance threshold, landing here as a topological "island" even
+        # though it is a surface mark, not a puncture. See
+        # MIN_ANOMALY_LIGHTNESS above - same check, same reasoning, applied
+        # to this signal too so a mark can't slip through whichever of the
+        # two candidate sources happens to catch it.
+        region_mean_l = cv2.mean(lab[:, :, 0], mask=region_mask)[0]
+        if region_mean_l < MIN_ANOMALY_LIGHTNESS:
+            continue
         cv2.drawContours(combined, [contour], -1, 255, thickness=cv2.FILLED)
 
     # Eroded much further in from the silhouette than stain_detector.py's
@@ -320,8 +357,15 @@ def find_hole_or_tear_regions(glove_result, preprocessed, min_area_ratio=LARGE_A
         glove_area = cv2.contourArea(glove_result["contour"])
         min_area = min_area_ratio * glove_area
         anomaly_contours, _ = cv2.findContours(outlier, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        big_anomalies = [c for c in anomaly_contours if cv2.contourArea(c) >= min_area]
-        cv2.drawContours(combined, big_anomalies, -1, 255, thickness=cv2.FILLED)
+        for contour in anomaly_contours:
+            if cv2.contourArea(contour) < min_area:
+                continue
+            region_mask = np.zeros(raw_mask.shape, dtype=np.uint8)
+            cv2.drawContours(region_mask, [contour], -1, 255, thickness=cv2.FILLED)
+            mean_lightness = cv2.mean(lab[:, :, 0], mask=region_mask)[0]
+            if mean_lightness < MIN_ANOMALY_LIGHTNESS:
+                continue  # a big dark mark is a surface stain/spot, not exposed skin/background
+            cv2.drawContours(combined, [contour], -1, 255, thickness=cv2.FILLED)
 
     if cv2.countNonZero(combined) == 0:
         return []
@@ -416,7 +460,13 @@ def in_finger_region(dip, centroid, scale):
 
 # A dip this much shallower than the deepest finger-shaped dip in the same
 # photo is treated as damage, not a real finger gap - see classify_dips().
-SHALLOW_DEPTH_RATIO = 0.3
+# Real finger valleys vary somewhat in depth within one photo (fingers are
+# rarely held perfectly evenly spread), so this needs enough headroom not
+# to reject a genuine valley just because another finger in the same photo
+# happened to be spread further - confirmed against a real photo where the
+# middle-ring finger gap, while shallower than the others, was still a
+# real, undamaged gap at 0.28x the photo's deepest valley.
+SHALLOW_DEPTH_RATIO = 0.25
 
 
 def classify_dips(dips, centroid, scale, max_finger_angle=120):

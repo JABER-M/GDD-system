@@ -3,6 +3,7 @@ import numpy as np
 
 from .helpers import (
     LARGE_ANOMALY_AREA_RATIO,
+    MIN_ANOMALY_LIGHTNESS,
     border_touching_margin_mask,
     color_residual_outlier_mask,
     contour_features,
@@ -13,9 +14,16 @@ MAD_MULTIPLIER = 6.0    # pixels beyond this many MADs from the local color tren
 BLUR_SIGMA = 25         # size of the "local area" used to estimate normal shading/color
 MIN_AREA_PX = 20
 MIN_AREA_RATIO = 0.0008
-# A color anomaly this big or bigger is treated as a hole/tear instead (see
-# find_hole_or_tear_regions in helpers.py) - a stain is a surface mark, not
-# damage, so it should stay well below "damage" scale.
+# A color anomaly this big AND this bright is treated as a hole/tear
+# instead (see find_hole_or_tear_regions in helpers.py, which uses the same
+# two numbers): large + bright means it plausibly exposes skin/background
+# through a puncture, which a stain does not do. A large but DARK anomaly -
+# e.g. a splash of dark ink/paint used to stage a "stain" defect for
+# testing - is not excluded here: it is not bright enough for hole/tear to
+# claim it either (see MIN_ANOMALY_LIGHTNESS), so without this "AND bright"
+# qualifier it would be excluded from both categories and never reported at
+# all. Only size on its own was tried first and rejected: a real photo with
+# two large dark ink marks (~1-7% of glove area) confirmed the gap.
 MAX_AREA_RATIO = LARGE_ANOMALY_AREA_RATIO
 MIN_CIRCULARITY = 0.4   # real stains are blob-shaped; thin slivers are segmentation edge noise
 
@@ -66,8 +74,14 @@ def detect_stains(glove_result, preprocessed):
     max_area = MAX_AREA_RATIO * glove_area
     for c in contours:
         feats = contour_features(c)
-        if feats["area"] < min_area or feats["area"] >= max_area:
-            continue  # too big to be a stain - hole/tear detection handles damage that size
+        if feats["area"] < min_area:
+            continue
+        if feats["area"] >= max_area:
+            region_mask = np.zeros(mask.shape, dtype=np.uint8)
+            cv2.drawContours(region_mask, [c], -1, 255, thickness=cv2.FILLED)
+            region_mean_l = cv2.mean(lab[:, :, 0], mask=region_mask)[0]
+            if region_mean_l >= MIN_ANOMALY_LIGHTNESS:
+                continue  # big AND bright - hole/tear detection handles damage that looks like this
         if feats["circularity"] < MIN_CIRCULARITY:
             continue  # thin sliver, not a blob-shaped stain
         regions.append(c)

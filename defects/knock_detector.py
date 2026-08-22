@@ -30,7 +30,14 @@ from .helpers import border_touching_margin_mask, contour_features, draw_contour
 # Brightness needs a stricter threshold than color does (spot/stain_detector
 # use 6.0): a matte, wrinkled glove has a lot of natural micro-highlights
 # along its creases, so a looser threshold flags normal texture as knocks.
-MAD_MULTIPLIER = 10.0
+# 10.0 was tried first and found too strict: a real, deliberately pressed
+# knock mark (a firm, rounded press with a smooth object, photographed
+# under direct flash) topped out at 9.79x the glove's own natural
+# brightness variation - just under the old threshold. Two reference
+# photos with no knock at all (one defect-free, one with real holes but no
+# knock) topped out at 3.97x and 5.13x, well clear of 8.0, so lowering to
+# 8.0 catches real knock marks with a comfortable margin on both sides.
+MAD_MULTIPLIER = 8.0
 BLUR_SIGMA = 40
 MIN_AREA_PX = 10
 MAX_AREA_RATIO = 0.01
