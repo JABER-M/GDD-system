@@ -2,13 +2,15 @@ import cv2
 import numpy as np
 
 EXPECTED_FINGERS = 5
-MIN_DEPTH_RATIO = 0.08     # valley depth vs. glove bbox diagonal, to count as a finger gap
+MIN_DEPTH_RATIO = 0.02     # valley depth vs. glove bbox diagonal, to count as a finger gap
+MAX_ANGLE_DEG = 120        # finger gaps are narrow notches; wider notches are palm/wrist curves
 
 
 def detect_missing_fingers(glove_result):
-    # Fingers are separated by deep "valleys" on the glove's outline. Count
-    # valleys via convexity defects; finger_count = valleys + 1. Fewer
-    # fingers than expected = missing/incomplete finger defect.
+    # Fingers are separated by narrow "valleys" on the glove's outline. Deep,
+    # WIDE notches also show up (e.g. where the thumb's base curves into the
+    # wrist) but are not finger gaps, so we require both a minimum depth and
+    # a narrow angle at the valley point to count it as a real finger gap.
     contour = glove_result["contour"]
     cropped = glove_result["cropped_bgr"]
     x, y, w, h = glove_result["bbox"]
@@ -28,8 +30,16 @@ def detect_missing_fingers(glove_result):
     valleys = []
     for start_idx, end_idx, far_idx, depth_fx in defects.reshape(-1, 4):
         depth = depth_fx / 256.0
-        if depth >= depth_threshold:
-            valleys.append(tuple(contour[far_idx][0]))
+        if depth < depth_threshold:
+            continue
+
+        start = contour[start_idx][0]
+        end = contour[end_idx][0]
+        far = contour[far_idx][0]
+        if _angle_degrees(start, end, far) > MAX_ANGLE_DEG:
+            continue
+
+        valleys.append(tuple(far))
 
     finger_count = len(valleys) + 1
 
@@ -39,6 +49,14 @@ def detect_missing_fingers(glove_result):
                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 140, 0), 2, cv2.LINE_AA)
 
     return _result(finger_count, valleys, annotated)
+
+
+def _angle_degrees(start, end, far):
+    # Angle at `far`, between the lines far->start and far->end.
+    a = start.astype(np.float32) - far.astype(np.float32)
+    b = end.astype(np.float32) - far.astype(np.float32)
+    cos_angle = np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-6)
+    return np.degrees(np.arccos(np.clip(cos_angle, -1.0, 1.0)))
 
 
 def _result(finger_count, valleys, annotated):

@@ -3,33 +3,61 @@ import numpy as np
 
 from .helpers import contour_features, draw_contours
 
-MAD_MULTIPLIER = 3.5   # pixels beyond this many MADs from the median color = outlier
+MAD_MULTIPLIER = 6.0    # pixels beyond this many MADs from the local color trend = outlier
+BLUR_SIGMA = 25         # size of the "local area" used to estimate normal shading/color
 MIN_AREA_PX = 20
 MIN_AREA_RATIO = 0.0008
+MIN_CIRCULARITY = 0.4   # real stains are blob-shaped; thin slivers are segmentation edge noise
 
 
 def detect_stains(glove_result, preprocessed):
-    # A stain = pixels whose LAB color deviates far from the glove's own
-    # median color (uses the image's own stats, so it adapts per photo).
-    mask = glove_result["mask"]
+    # A stain is a local CHANGE IN COLOR (chroma), not a change in
+    # brightness. A glove is a curved, glossy object, so brightness alone
+    # varies a lot across it even with no defect at all (shading, creases,
+    # highlights) - comparing against one single "typical color" for the
+    # whole glove flags most of that shading as a false stain.
+    #
+    # So instead we:
+    #   1. Estimate the LOCAL "normal" color at every point by blurring the
+    #      glove with a wide kernel (this follows slow lighting changes but
+    #      smooths out anything small, like an actual stain).
+    #   2. Subtract that from the real image: what's left is only the small,
+    #      local anomalies - shading gradients cancel out.
+    #   3. Only look at the A/B (color) channels of that residual, not L
+    #      (brightness) - this is what tells a real stain (different color)
+    #      apart from a shadow/highlight/wrinkle (same color, different
+    #      brightness).
     contour = glove_result["contour"]
     x, y, w, h = glove_result["bbox"]
     cropped = glove_result["cropped_bgr"]
     glove_area = cv2.contourArea(contour)
 
-    lab = preprocessed["lab"]
-    glove_pixels = lab[mask == 255].astype(np.float32)
-    if glove_pixels.shape[0] == 0:
+    # Shrink the mask inward first so pixels right at the glove's silhouette
+    # (blended with the background) aren't mistaken for real glove color.
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    mask = cv2.erode(glove_result["mask"], kernel, iterations=2)
+    if cv2.countNonZero(mask) == 0:
         return _empty_result(cropped)
 
-    median_color = np.median(glove_pixels, axis=0)
-    mad = np.maximum(np.median(np.abs(glove_pixels - median_color), axis=0), 1.0)
+    lab = preprocessed["lab"].astype(np.float32)
+    mask_f = (mask == 255).astype(np.float32)
 
-    distance = np.linalg.norm((lab.astype(np.float32) - median_color) / mad, axis=2)
+    # Blur restricted to glove pixels only (a normal blur would pull in
+    # background color near the edges): blur(image * mask) / blur(mask).
+    local_avg = cv2.GaussianBlur(lab * mask_f[:, :, None], (0, 0), BLUR_SIGMA)
+    coverage = cv2.GaussianBlur(mask_f, (0, 0), BLUR_SIGMA)
+    local_avg /= np.maximum(coverage[:, :, None], 1e-3)
+
+    color_residual = np.linalg.norm((lab - local_avg)[:, :, 1:3], axis=2)  # A,B only
+
+    residual_in_glove = color_residual[mask == 255]
+    median = np.median(residual_in_glove)
+    mad = np.maximum(np.median(np.abs(residual_in_glove - median)), 1.0)
+    threshold = median + MAD_MULTIPLIER * mad
+
     outlier_mask = np.zeros(mask.shape, dtype=np.uint8)
-    outlier_mask[(distance > MAD_MULTIPLIER) & (mask == 255)] = 255
+    outlier_mask[(color_residual > threshold) & (mask == 255)] = 255
 
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
     outlier_mask = cv2.morphologyEx(outlier_mask, cv2.MORPH_OPEN, kernel)
     outlier_mask = cv2.morphologyEx(outlier_mask, cv2.MORPH_CLOSE, kernel)
 
@@ -41,6 +69,8 @@ def detect_stains(glove_result, preprocessed):
         feats = contour_features(c)
         if feats["area"] < min_area:
             continue
+        if feats["circularity"] < MIN_CIRCULARITY:
+            continue  # thin sliver, not a blob-shaped stain
         regions.append(c)
         metrics.append(feats)
 
