@@ -1,12 +1,16 @@
 import cv2
 import numpy as np
 
-from .helpers import contour_features, draw_contours
+from .helpers import LARGE_ANOMALY_AREA_RATIO, color_residual_outlier_mask, contour_features, draw_contours
 
 MAD_MULTIPLIER = 6.0    # pixels beyond this many MADs from the local color trend = outlier
 BLUR_SIGMA = 25         # size of the "local area" used to estimate normal shading/color
 MIN_AREA_PX = 20
 MIN_AREA_RATIO = 0.0008
+# A color anomaly this big or bigger is treated as a hole/tear instead (see
+# find_hole_or_tear_regions in helpers.py) - a stain is a surface mark, not
+# damage, so it should stay well below "damage" scale.
+MAX_AREA_RATIO = LARGE_ANOMALY_AREA_RATIO
 MIN_CIRCULARITY = 0.4   # real stains are blob-shaped; thin slivers are segmentation edge noise
 
 
@@ -40,24 +44,7 @@ def detect_stains(glove_result, preprocessed):
         return _empty_result(cropped)
 
     lab = preprocessed["lab"].astype(np.float32)
-    mask_f = (mask == 255).astype(np.float32)
-
-    # Blur restricted to glove pixels only (a normal blur would pull in
-    # background color near the edges): blur(image * mask) / blur(mask).
-    local_avg = cv2.GaussianBlur(lab * mask_f[:, :, None], (0, 0), BLUR_SIGMA)
-    coverage = cv2.GaussianBlur(mask_f, (0, 0), BLUR_SIGMA)
-    local_avg /= np.maximum(coverage[:, :, None], 1e-3)
-
-    color_residual = np.linalg.norm((lab - local_avg)[:, :, 1:3], axis=2)  # A,B only
-
-    residual_in_glove = color_residual[mask == 255]
-    median = np.median(residual_in_glove)
-    mad = np.maximum(np.median(np.abs(residual_in_glove - median)), 1.0)
-    threshold = median + MAD_MULTIPLIER * mad
-
-    outlier_mask = np.zeros(mask.shape, dtype=np.uint8)
-    outlier_mask[(color_residual > threshold) & (mask == 255)] = 255
-
+    outlier_mask = color_residual_outlier_mask(mask, lab, MAD_MULTIPLIER, BLUR_SIGMA)
     outlier_mask = cv2.morphologyEx(outlier_mask, cv2.MORPH_OPEN, kernel)
     outlier_mask = cv2.morphologyEx(outlier_mask, cv2.MORPH_CLOSE, kernel)
 
@@ -65,10 +52,11 @@ def detect_stains(glove_result, preprocessed):
 
     regions, metrics = [], []
     min_area = max(MIN_AREA_PX, MIN_AREA_RATIO * glove_area)
+    max_area = MAX_AREA_RATIO * glove_area
     for c in contours:
         feats = contour_features(c)
-        if feats["area"] < min_area:
-            continue
+        if feats["area"] < min_area or feats["area"] >= max_area:
+            continue  # too big to be a stain - hole/tear detection handles damage that size
         if feats["circularity"] < MIN_CIRCULARITY:
             continue  # thin sliver, not a blob-shaped stain
         regions.append(c)

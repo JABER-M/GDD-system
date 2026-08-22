@@ -1,18 +1,18 @@
 import cv2
 
-from .helpers import contour_features, draw_contours, find_internal_regions
+from .helpers import contour_features, draw_contours, find_hole_or_tear_regions
 
 MIN_AREA_PX = 25
 MAX_AREA_RATIO = 0.15
 MIN_CIRCULARITY = 0.35   # round patch = hole. Elongated patches are left for tear_detector.py.
 
 
-def detect_holes(glove_result):
+def detect_holes(glove_result, preprocessed):
     glove_area = cv2.contourArea(glove_result["contour"])
     cropped = glove_result["cropped_bgr"]
     x, y, w, h = glove_result["bbox"]
 
-    candidates = find_internal_regions(glove_result["raw_mask"])
+    candidates = find_hole_or_tear_regions(glove_result, preprocessed)
 
     regions, metrics = [], []
     for contour in candidates:

@@ -1,7 +1,7 @@
 import cv2
 import numpy as np
 
-from .helpers import contour_features, draw_contours
+from .helpers import color_residual_outlier_mask, contour_features, draw_contours
 
 # A spot is a small, roughly round mark on the glove surface (for example a
 # drop of dirt or a small blemish) - a local change in the material's actual
@@ -55,23 +55,7 @@ def detect_spots(glove_result, preprocessed):
         return _empty_result(cropped)
 
     lab = preprocessed["lab"].astype(np.float32)
-    mask_f = (mask == 255).astype(np.float32)
-
-    # Blur restricted to glove pixels only (a normal blur would pull in
-    # background color near the edges): blur(image * mask) / blur(mask).
-    local_avg = cv2.GaussianBlur(lab * mask_f[:, :, None], (0, 0), BLUR_SIGMA)
-    coverage = cv2.GaussianBlur(mask_f, (0, 0), BLUR_SIGMA)
-    local_avg /= np.maximum(coverage[:, :, None], 1e-3)
-
-    color_residual = np.linalg.norm((lab - local_avg)[:, :, 1:3], axis=2)  # A,B only
-
-    residual_in_glove = color_residual[mask == 255]
-    median = np.median(residual_in_glove)
-    mad = np.maximum(np.median(np.abs(residual_in_glove - median)), 1.0)
-    threshold = median + MAD_MULTIPLIER * mad
-
-    outlier_mask = np.zeros(mask.shape, dtype=np.uint8)
-    outlier_mask[(color_residual > threshold) & (mask == 255)] = 255
+    outlier_mask = color_residual_outlier_mask(mask, lab, MAD_MULTIPLIER, BLUR_SIGMA)
 
     small_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
     outlier_mask = cv2.morphologyEx(outlier_mask, cv2.MORPH_OPEN, small_kernel)

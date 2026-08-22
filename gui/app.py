@@ -14,7 +14,7 @@ PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
-from main import run_all_detectors
+from main import run_all_detectors, build_glove_segmentation_image
 from preprocessing.image_prep import resize_max_dim
 
 # The order the six defects are shown in the results list, and the friendly
@@ -26,7 +26,14 @@ DEFECT_LABELS = {
     "tears": "Tears",
     "spots": "Spots",
     "knocking": "Knocking",
+    "edge_tears": "Edge Tears",
 }
+
+# Key used (in self.display_keys, see below) for the extra, non-defect first
+# row of the results list: a preview of the glove right after it has been
+# isolated from the background, with no defect markings on it yet.
+GLOVE_SEGMENTATION_KEY = "glove_segmentation"
+GLOVE_SEGMENTATION_LABEL = "Glove Segmentation"
 
 # Tkinter's PhotoImage widget can only load images from files on disk (or
 # from raw image bytes), it cannot show an OpenCV image (a NumPy array)
@@ -50,7 +57,11 @@ class GddApp(tk.Tk):
 
         # State kept between button clicks.
         self.selected_image_path = None   # path to the photo the user picked
-        self.detection_results = None     # dict returned by run_all_detectors
+        self.detection_results = None     # dict returned by run_all_detectors:
+                                           # {"glove": ..., "defects": {...}}
+        self.display_keys = []            # maps each results_listbox row to
+                                           # either GLOVE_SEGMENTATION_KEY or
+                                           # a defect name, in list order
         self.current_photo_image = None   # keeps a reference so Tkinter does
                                            # not garbage-collect the displayed
                                            # image (a common Tkinter gotcha)
@@ -107,6 +118,7 @@ class GddApp(tk.Tk):
 
         # Clear any results from a previous image.
         self.detection_results = None
+        self.display_keys = []
         self.results_listbox.delete(0, tk.END)
 
         # Show the original photo the user picked, before running detection.
@@ -129,21 +141,29 @@ class GddApp(tk.Tk):
 
         if self.detection_results is None:
             self.status_label.config(text="No glove detected")
+            self.display_keys = []
             self.results_listbox.delete(0, tk.END)
             return
 
         self.status_label.config(text="")
         self._fill_results_list()
 
-        # Automatically show the first defect's annotated image, so the user
-        # sees a result right away without needing to click the list first.
-        first_defect_name = list(self.detection_results.keys())[0]
+        # Automatically show the first row (the isolated glove, with no
+        # defect markings), so the user sees a result right away without
+        # needing to click the list first.
         self.results_listbox.selection_set(0)
-        self._show_defect_image(first_defect_name)
+        self._show_display_item(self.display_keys[0])
 
     def _fill_results_list(self):
         self.results_listbox.delete(0, tk.END)
-        for defect_name, result in self.detection_results.items():
+
+        # Row 0 is always the isolated glove, before any defect markings.
+        self.display_keys = [GLOVE_SEGMENTATION_KEY]
+        self.results_listbox.insert(tk.END, GLOVE_SEGMENTATION_LABEL)
+
+        defect_results = self.detection_results["defects"]
+        for defect_name, result in defect_results.items():
+            self.display_keys.append(defect_name)
             label = DEFECT_LABELS[defect_name]
             status = "detected" if result["detected"] else "not detected"
             count = result["count"]
@@ -159,13 +179,21 @@ class GddApp(tk.Tk):
             return
 
         selected_index = selected_indexes[0]
-        defect_name = list(self.detection_results.keys())[selected_index]
-        self._show_defect_image(defect_name)
+        display_key = self.display_keys[selected_index]
+        self._show_display_item(display_key)
 
-    def _show_defect_image(self, defect_name):
-        result = self.detection_results[defect_name]
-        annotated_image = result["annotated_image"]
-        self._show_image(annotated_image)
+    def _show_display_item(self, display_key):
+        """Show the image for one row of the results list: either the
+        isolated glove (GLOVE_SEGMENTATION_KEY) or one defect's annotated
+        image (looked up by defect name)."""
+        if display_key == GLOVE_SEGMENTATION_KEY:
+            glove = self.detection_results["glove"]
+            image = build_glove_segmentation_image(glove)
+        else:
+            result = self.detection_results["defects"][display_key]
+            image = result["annotated_image"]
+
+        self._show_image(image)
 
     def _show_image(self, bgr_image):
         """Display an OpenCV image (a BGR NumPy array) in the image_label."""
