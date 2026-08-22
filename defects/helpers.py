@@ -33,6 +33,45 @@ def draw_contours(image, contours, color=(0, 0, 255), thickness=2, label=None):
     return out
 
 
+# Used by every defect detector that looks for a local color/brightness
+# anomaly (holes, tears, stains, spots, knocking): where the glove touches
+# the edge of the PHOTO FRAME, that is the wrist/cuff opening - the arm
+# just continues off-frame there, it is not the glove's own edge. In these
+# test photos the material is loose and rolled at that opening, so it
+# blends gradually into wrist/arm skin over a fairly wide band. Without
+# this exclusion, every detector above independently rediscovers that
+# blend band and misreads it as damage (an exposed-skin "hole", a long
+# "tear" running along the cuff, a "stain" where the color shifts from
+# glove to skin) - the margin here is the one place that knowledge is
+# encoded, so every detector using it stays consistent.
+BORDER_TOUCH_PX = 5       # how close to the frame edge counts as "touching"
+CUFF_MARGIN_RATIO = 0.25  # how far inward from a touched edge to exclude, vs glove bbox diagonal
+
+
+def border_touching_margin_mask(glove_result, image_shape):
+    """
+    255 = safe to run defect analysis on, 0 = excluded margin near a photo
+    frame edge the glove's silhouette touches. A photo where the whole
+    glove sits comfortably inside the frame (no side touched) is returned
+    unchanged (all 255) - this only matters for a cropped-in shot where the
+    wrist/arm exits the frame.
+    """
+    h, w = image_shape[:2]
+    x, y, bw, bh = glove_result["bbox"]
+    margin = max(1, int(CUFF_MARGIN_RATIO * np.hypot(bw, bh)))
+
+    safe = np.full((h, w), 255, dtype=np.uint8)
+    if x <= BORDER_TOUCH_PX:
+        safe[:, :margin] = 0
+    if y <= BORDER_TOUCH_PX:
+        safe[:margin, :] = 0
+    if x + bw >= w - BORDER_TOUCH_PX:
+        safe[:, w - margin:] = 0
+    if y + bh >= h - BORDER_TOUCH_PX:
+        safe[h - margin:, :] = 0
+    return safe
+
+
 # Used by hole_detector.py and tear_detector.py. Both defects look for the
 # same thing at the pixel level - a patch that is NOT glove material inside
 # the glove's silhouette (background peeking through a hole, or skin
@@ -90,31 +129,66 @@ def find_internal_regions(raw_mask):
 # around it cancels out that slow shading gradient and leaves only real,
 # local anomalies. Each caller then decides its own size/shape cutoffs for
 # what counts as a hole vs. a tear vs. a stain vs. a spot.
-def color_residual_outlier_mask(mask, lab, mad_multiplier, blur_sigma):
+# A pixel's "local average color" is only trustworthy if enough of its own
+# blur neighborhood is actually glove (mask==255) - right at any mask
+# boundary (the glove's true edge, or a thin finger surrounded by
+# background on both sides) too little of the blur kernel lands on real
+# glove pixels, so the normalized average there is really an estimate from
+# a handful of pixels, not the wide local blur it's supposed to be. That
+# makes the residual there unreliable in a way that looks exactly like a
+# real anomaly. MIN_RELIABLE_COVERAGE excludes those pixels from ever being
+# flagged, instead of trying to erode a fixed margin away from every mask
+# boundary - eroding enough to be safe with a wide blur_sigma (see
+# LARGE_ANOMALY_BLUR_SIGMA above) would erase whole fingers, which are
+# rarely wider than such a margin needs to be.
+MIN_RELIABLE_COVERAGE = 0.6
+
+
+def color_residual_map(mask, lab, blur_sigma):
+    """
+    For every glove pixel, how far its A/B (color, not brightness) differs
+    from the color immediately around it. Returns (residual, median, mad,
+    reliable): the full per-pixel residual map, its own median/MAD (median
+    absolute deviation) within the glove - computed only from pixels where
+    the local average itself is trustworthy (see MIN_RELIABLE_COVERAGE
+    above) - and that same reliable/not-reliable mask, which callers use to
+    turn this into an adaptive, per-photo outlier threshold (see
+    color_residual_outlier_mask below, and find_hole_or_tear_regions'
+    "is this shadow or real color?" check further down this file).
+    """
     mask_f = (mask == 255).astype(np.float32)
     if not np.any(mask_f):
-        return np.zeros(mask.shape, dtype=np.uint8)
+        zeros = np.zeros(mask.shape, dtype=np.float32)
+        return zeros, 0.0, 1.0, np.zeros(mask.shape, dtype=bool)
 
     # Blur restricted to glove pixels only (a normal blur would pull in
     # background color near the edges): blur(image * mask) / blur(mask).
-    local_avg = cv2.GaussianBlur(lab * mask_f[:, :, None], (0, 0), blur_sigma)
     coverage = cv2.GaussianBlur(mask_f, (0, 0), blur_sigma)
+    local_avg = cv2.GaussianBlur(lab * mask_f[:, :, None], (0, 0), blur_sigma)
     local_avg /= np.maximum(coverage[:, :, None], 1e-3)
 
     # Only the A/B (color) channels of the residual, not L (brightness) -
     # this is what tells a real color anomaly apart from a shadow, highlight
     # or wrinkle (same color, different brightness).
-    color_residual = np.linalg.norm((lab - local_avg)[:, :, 1:3], axis=2)
+    residual = np.linalg.norm((lab - local_avg)[:, :, 1:3], axis=2)
 
-    residual_in_mask = color_residual[mask == 255]
+    reliable = (mask == 255) & (coverage >= MIN_RELIABLE_COVERAGE)
+    residual_in_mask = residual[reliable]
+    if residual_in_mask.size == 0:
+        return residual, 0.0, 1.0, reliable
     median = np.median(residual_in_mask)
     # "median absolute deviation": how much color naturally varies within
     # the glove itself. max(...,1) avoids divide-by-zero.
     mad = np.maximum(np.median(np.abs(residual_in_mask - median)), 1.0)
+    return residual, median, mad, reliable
+
+
+def color_residual_outlier_mask(mask, lab, mad_multiplier, blur_sigma):
+    residual, median, mad, reliable = color_residual_map(mask, lab, blur_sigma)
     threshold = median + mad_multiplier * mad
 
     outlier = np.zeros(mask.shape, dtype=np.uint8)
-    outlier[(color_residual > threshold) & (mask == 255)] = 255
+    outlier[(residual > threshold) & reliable] = 255
     return outlier
 
 
@@ -138,12 +212,87 @@ def color_residual_outlier_mask(mask, lab, mad_multiplier, blur_sigma):
 # caught by both is not counted twice.
 LARGE_ANOMALY_AREA_RATIO = 0.005  # boundary vs. stains/spots - see stain_detector.py's own upper bound
 
+# A large hole/tear has an interior color that is fairly uniform (skin, or
+# background), so with blur_sigma=25 (the same value stain_detector.py/
+# spot_detector.py use for small marks) the local blur near the MIDDLE of a
+# wide anomaly ends up averaging mostly the anomaly's OWN pixels, not the
+# surrounding glove - so only a thin RING around its true edge clears the
+# outlier threshold, and the interior reads as "normal" again. That ring has
+# much less area and a much lower circularity than the real hole - enough to
+# make hole_detector.py miss it and tear_detector.py misclassify it as a
+# tear instead.
+#
+# Widening blur_sigma itself to fix this (tried first) backfired: a wider
+# blur also tracks ordinary smooth lighting gradients across the glove's
+# curved surface less tightly, so it started reading normal shading
+# elsewhere on a defect-free glove as a false anomaly. So instead we keep
+# blur_sigma at the same value that works well for stains/spots, and instead
+# CLOSE the thresholded outlier mask with a wide kernel below - that fills
+# the hollow middle of a ring-shaped detection back into a solid blob
+# without changing what counts as an outlier in the first place. Confirmed
+# against a real photo with two ~70-90px wide holes (this recovers their
+# real, solid, round shape) and a real defect-free glove (this does not
+# introduce a false anomaly the way widening blur_sigma did).
+LARGE_ANOMALY_CLOSE_PX = 90
+
+# How far above the glove's own normal color variation a pixel must sit to
+# count as "real color evidence" for the shadow-vs-real-damage check below,
+# and what fraction of a candidate region needs to clear that bar. A shadow
+# (crease, wrinkle) can drag its MEAN residual up somewhat just from noise/
+# compression, so checking the mean alone isn't a reliable split - genuine
+# exposed skin/background is a strong anomaly across a good chunk of the
+# patch, while a shadow is only weakly, patchily elevated. Requiring a
+# fraction of clearly-anomalous pixels (not just an elevated average)
+# separates the two cleanly - verified against a real photo where deep
+# finger-crease shadows, on a dark background, were briefly misread as
+# tears by the mean-only version of this check.
+SHADOW_REJECTION_MAD_MULTIPLIER = 4.0
+SHADOW_REJECTION_MIN_FRACTION = 0.65
+
 
 def find_hole_or_tear_regions(glove_result, preprocessed, min_area_ratio=LARGE_ANOMALY_AREA_RATIO,
                                mad_multiplier=6.0, blur_sigma=25):
     raw_mask = glove_result["raw_mask"]
+    lab = preprocessed["lab"].astype(np.float32)
     combined = np.zeros(raw_mask.shape, dtype=np.uint8)
-    cv2.drawContours(combined, find_internal_regions(raw_mask), -1, 255, thickness=cv2.FILLED)
+
+    # Signal 1: topological islands (find_internal_regions). On its own,
+    # this is fooled by a plain SHADOW that happens to be dark enough for
+    # glove_detector.py's segmentation to misread as "background peeking
+    # through" - e.g. deep creases between fingers, photographed against a
+    # dark background, can look just as "not-glove" to a brightness/color-
+    # distance test as an actual hole does. A shadow has the same hue as
+    # the glove though, just less light on it - only its L (brightness)
+    # differs, not its A/B (color) - so we cross-check every topological
+    # candidate against real color evidence before trusting it: keep it
+    # only if the patch is ALSO a genuine local color anomaly, using the
+    # same A/B-only residual signal 2 (below) uses to find damage in the
+    # first place.
+    #
+    # Deliberately NOT intersected with border_touching_margin_mask here:
+    # find_internal_regions only ever returns fully enclosed islands (an
+    # "internal" RETR_CCOMP contour, surrounded by glove on all sides), so
+    # it essentially never rediscovers the cuff blend band on its own (that
+    # band is a gradient touching the frame edge, not an enclosed island) -
+    # confirmed against these test photos. Excluding a wrist-side margin
+    # here as well nearly cost a real, large, centrally-located tear in a
+    # portrait-oriented photo where the wrist (and so the margin) reaches
+    # much further up the frame than the actual blend band does.
+    shallow_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    shallow_mask = cv2.erode(glove_result["mask"], shallow_kernel, iterations=2)
+    residual, median, mad, reliable = color_residual_map(shallow_mask, lab, blur_sigma)
+    color_evidence_threshold = median + SHADOW_REJECTION_MAD_MULTIPLIER * mad
+
+    for contour in find_internal_regions(raw_mask):
+        region_mask = np.zeros(raw_mask.shape, dtype=np.uint8)
+        cv2.drawContours(region_mask, [contour], -1, 255, thickness=cv2.FILLED)
+        region_residuals = residual[(region_mask == 255) & reliable]
+        if region_residuals.size == 0:
+            continue  # entirely outside the safety margin from the edge - too close to judge
+        anomalous_fraction = np.mean(region_residuals > color_evidence_threshold)
+        if anomalous_fraction < SHADOW_REJECTION_MIN_FRACTION:
+            continue  # only patchily/weakly elevated - a shadow, not real damage
+        cv2.drawContours(combined, [contour], -1, 255, thickness=cv2.FILLED)
 
     # Eroded much further in from the silhouette than stain_detector.py's
     # own erosion (iterations=2): the glove's TRUE edge - especially the
@@ -156,12 +305,17 @@ def find_hole_or_tear_regions(glove_result, preprocessed, min_area_ratio=LARGE_A
     # band, so this deeper erosion still finds it fine (find_internal_
     # regions above has no such margin and remains the more sensitive of
     # the two candidate sources for damage close to the edge).
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-    inner_mask = cv2.erode(glove_result["mask"], kernel, iterations=6)
+    deep_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    inner_mask = cv2.erode(glove_result["mask"], deep_kernel, iterations=6)
+    inner_mask = cv2.bitwise_and(inner_mask, border_touching_margin_mask(glove_result, raw_mask.shape))
     if cv2.countNonZero(inner_mask) > 0:
-        lab = preprocessed["lab"].astype(np.float32)
         outlier = color_residual_outlier_mask(inner_mask, lab, mad_multiplier, blur_sigma)
-        outlier = cv2.morphologyEx(outlier, cv2.MORPH_CLOSE, kernel)
+        # Wide close: fills the hollow middle of a large anomaly's ring-
+        # shaped detection back into a solid blob - see LARGE_ANOMALY_CLOSE_PX
+        # above for why this is done here instead of via a wider blur.
+        close_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE,
+                                                   (LARGE_ANOMALY_CLOSE_PX, LARGE_ANOMALY_CLOSE_PX))
+        outlier = cv2.morphologyEx(outlier, cv2.MORPH_CLOSE, close_kernel)
 
         glove_area = cv2.contourArea(glove_result["contour"])
         min_area = min_area_ratio * glove_area
@@ -175,7 +329,7 @@ def find_hole_or_tear_regions(glove_result, preprocessed, min_area_ratio=LARGE_A
     return contours
 
 
-# Used by finger_detector.py and edge_tear_detector.py. Both look for places
+# Used by finger_detector.py and tear_detector.py. Both look for places
 # where the glove's real outline dips inward from its convex hull (the
 # "rubber band" shape with no dents) - a finger gap is one such dip, and so
 # is damage sitting right on the glove's outer edge. They differ only in
@@ -245,7 +399,7 @@ def in_finger_region(dip, centroid, scale):
     depth/angle check alone, but its neighboring hull points sit much
     closer to the centroid - still near the main body of the glove, not
     out at a fingertip - so this catches the difference
-    finger_detector.py and edge_tear_detector.py each need, in opposite
+    finger_detector.py and tear_detector.py each need, in opposite
     directions.
 
     Distance from the centroid, not a fixed "up/down" direction, is used
@@ -267,7 +421,7 @@ SHALLOW_DEPTH_RATIO = 0.3
 
 def classify_dips(dips, centroid, scale, max_finger_angle=120):
     """Splits convexity-defect dips (see convexity_dips() above) into two
-    groups, shared by finger_detector.py and edge_tear_detector.py so the
+    groups, shared by finger_detector.py and tear_detector.py so the
     two stay perfectly consistent - every dip lands in exactly one of them:
 
       - finger dips: dips that plausibly sit between two real fingers.
@@ -281,7 +435,7 @@ def classify_dips(dips, centroid, scale, max_finger_angle=120):
         wrist cropped out) - but even then, it is usually noticeably
         shallower than the real finger gaps in that same photo, since real
         fingers are longer than any accidental damage-induced notch.
-      - other dips: everything else - candidates for edge_tear_detector.py.
+      - other dips: everything else - candidates for tear_detector.py.
     """
     candidates = [d for d in dips if d["angle"] <= max_finger_angle and in_finger_region(d, centroid, scale)]
     deepest = max((d["depth"] for d in candidates), default=0.0)

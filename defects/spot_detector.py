@@ -1,7 +1,7 @@
 import cv2
 import numpy as np
 
-from .helpers import color_residual_outlier_mask, contour_features, draw_contours
+from .helpers import border_touching_margin_mask, color_residual_outlier_mask, contour_features, draw_contours
 
 # A spot is a small, roughly round mark on the glove surface (for example a
 # drop of dirt or a small blemish) - a local change in the material's actual
@@ -49,8 +49,12 @@ def detect_spots(glove_result, preprocessed):
     # a curved edge) aren't mistaken for a real spot. Spots look for very
     # small regions, so they need a bigger safety margin from the edge than
     # stain_detector.py does.
+    # Also cut out the wrist/cuff opening margin (see
+    # border_touching_margin_mask in helpers.py) - the material naturally
+    # blends into skin color over a visible band there.
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
     mask = cv2.erode(glove_result["mask"], kernel, iterations=4)
+    mask = cv2.bitwise_and(mask, border_touching_margin_mask(glove_result, mask.shape))
     if cv2.countNonZero(mask) == 0:
         return _empty_result(cropped)
 

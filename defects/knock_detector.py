@@ -1,7 +1,7 @@
 import cv2
 import numpy as np
 
-from .helpers import contour_features, draw_contours
+from .helpers import border_touching_margin_mask, contour_features, draw_contours
 
 # "Knocking" is a small impact or dent on the glove. When the material gets
 # locally deformed like this, it often reflects light differently and shows
@@ -45,8 +45,13 @@ def detect_knocks(glove_result, preprocessed):
     # Shrink the mask inward first so pixels right at the glove's silhouette
     # (blended with the background) aren't mistaken for real glove
     # brightness.
+    # Also cut out the wrist/cuff opening margin (see
+    # border_touching_margin_mask in helpers.py) - the loose, rolled
+    # material there can catch the light differently from the rest of the
+    # glove regardless of damage.
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
     mask = cv2.erode(glove_result["mask"], kernel, iterations=2)
+    mask = cv2.bitwise_and(mask, border_touching_margin_mask(glove_result, mask.shape))
     if cv2.countNonZero(mask) == 0:
         return _empty_result(cropped)
 

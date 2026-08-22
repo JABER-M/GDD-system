@@ -9,7 +9,7 @@ MIN_DEPTH_RATIO = 0.02     # valley depth vs. glove bbox diagonal, to count as a
 
 def detect_missing_fingers(glove_result):
     # Fingers are separated by narrow "valleys" on the glove's outline.
-    # classify_dips() (helpers.py, shared with edge_tear_detector.py) picks
+    # classify_dips() (helpers.py, shared with tear_detector.py) picks
     # out the dips that plausibly represent real finger gaps: narrow,
     # sitting between two fingertip-like hull points, and not suspiciously
     # shallower than the other such dips in the same photo (which would

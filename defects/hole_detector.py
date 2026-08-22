@@ -2,7 +2,7 @@ import cv2
 
 from .helpers import contour_features, draw_contours, find_hole_or_tear_regions
 
-MIN_AREA_PX = 25
+MIN_AREA_PX = 100  # small noise flecks (a few pixels of JPEG chroma noise) are common in dark shadow areas
 MAX_AREA_RATIO = 0.15
 MIN_CIRCULARITY = 0.35   # round patch = hole. Elongated patches are left for tear_detector.py.
 

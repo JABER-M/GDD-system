@@ -1,7 +1,13 @@
 import cv2
 import numpy as np
 
-from .helpers import LARGE_ANOMALY_AREA_RATIO, color_residual_outlier_mask, contour_features, draw_contours
+from .helpers import (
+    LARGE_ANOMALY_AREA_RATIO,
+    border_touching_margin_mask,
+    color_residual_outlier_mask,
+    contour_features,
+    draw_contours,
+)
 
 MAD_MULTIPLIER = 6.0    # pixels beyond this many MADs from the local color trend = outlier
 BLUR_SIGMA = 25         # size of the "local area" used to estimate normal shading/color
@@ -38,8 +44,13 @@ def detect_stains(glove_result, preprocessed):
 
     # Shrink the mask inward first so pixels right at the glove's silhouette
     # (blended with the background) aren't mistaken for real glove color.
+    # Also cut out the wrist/cuff opening margin (see
+    # border_touching_margin_mask in helpers.py) - the material naturally
+    # blends into skin color over a visible band there, which otherwise
+    # reads as a giant stain on every photo where the wrist is in frame.
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
     mask = cv2.erode(glove_result["mask"], kernel, iterations=2)
+    mask = cv2.bitwise_and(mask, border_touching_margin_mask(glove_result, mask.shape))
     if cv2.countNonZero(mask) == 0:
         return _empty_result(cropped)
 

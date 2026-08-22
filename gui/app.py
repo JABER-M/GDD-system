@@ -6,15 +6,17 @@ import cv2
 import tkinter as tk
 from tkinter import filedialog, messagebox
 
-# This file lives inside the gui/ folder, but it needs to import main.py and
-# the preprocessing/detection/defects packages that live one level up, at
-# the project root. This adds the project root to Python's search path so
-# those imports work no matter where this script is run from.
+# This file lives inside the gui/ folder, but it needs to import pipeline.py
+# and the preprocessing/detection/defects packages that live one level up,
+# at the project root. This adds the project root to Python's search path
+# so those imports work no matter where this script is run from (normally
+# it's launched via "python main.py", but "python gui/app.py" directly
+# still works too).
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
-from main import run_all_detectors, build_glove_segmentation_image
+from pipeline import run_all_detectors, build_glove_segmentation_image
 from preprocessing.image_prep import resize_max_dim
 
 # The order the six defects are shown in the results list, and the friendly
@@ -26,7 +28,6 @@ DEFECT_LABELS = {
     "tears": "Tears",
     "spots": "Spots",
     "knocking": "Knocking",
-    "edge_tears": "Edge Tears",
 }
 
 # Key used (in self.display_keys, see below) for the extra, non-defect first
@@ -132,7 +133,7 @@ class GddApp(tk.Tk):
             return
 
         try:
-            # This calls the exact same pipeline as main.py:
+            # This calls the same pipeline.py used by main.py's CLI mode:
             # load image -> preprocess -> detect_glove -> run all 6 detectors.
             self.detection_results = run_all_detectors(self.selected_image_path)
         except Exception as error:
